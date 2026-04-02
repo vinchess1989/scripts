@@ -40,9 +40,6 @@ Changelog:
   * FEATURE: Ball Count Analysis tool (Tools -> Ball Count Analysis).
   * Reads Net Sort sheet; computes per-die L2 ball requirements from L1 bump ratios.
   * Searchable, sortable table with TOTALS row; Privacy Blur and Excel export.
-================================================================================
-"""
-__version__ = "2.22.0"
 
 import sys
 import os
