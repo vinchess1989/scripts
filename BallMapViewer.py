@@ -214,7 +214,8 @@ class HTMLDelegate(QStyledItemDelegate):
             ind_rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemCheckIndicator, options, option.widget)
             
             print(f"\n--- [DEBUG-HTMLDelegate] Checkbox Click Telemetry ---")
-            print(f"Row Text (stripped): {re.sub(r'<[^>]+>', '', options.text)}")
+            _stripped = re.sub(r'<[^>]+>', '', options.text)
+            print(f"Row Text (stripped): {_stripped}")
             print(f"Option Rect: X:{option.rect.x()} Y:{option.rect.y()} W:{option.rect.width()} H:{option.rect.height()}")
             print(f"Indicator Rect (OS calcs): X:{ind_rect.x()} Y:{ind_rect.y()} W:{ind_rect.width()} H:{ind_rect.height()}")
             print(f"State_Enabled: {bool(options.state & QStyle.StateFlag.State_Enabled)}")
