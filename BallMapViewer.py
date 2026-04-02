@@ -1,12 +1,12 @@
 """
 ================================================================================
 Ball Map Viewer
-Version: 2.21.0 (True EDA Canvas Engine & Editor Suite)
+Version: 2.22.0 (True EDA Canvas Engine & Editor Suite)
 ================================================================================
 Changelog:
 - v2.0-v2.8: GraphicsView migration, DRC Engine, HTML Delegates, Zoom fixes.
 - v2.9: Checkbox transparency fix, Master DRC select, Recent Files, Diff Pair UX.
-- v2.10: 
+- v2.10:
   * FIX/DEBUG: Added OS-level bounding box telemetry to HTMLDelegate.
   * UX: Smart-Panning for Differential Pairs.
 - v2.11: DIFF GUI non-modal implementation, zoom fixes, Delta column.
@@ -36,9 +36,10 @@ Changelog:
   * UI: Added visible resize handles (horizontal/vertical lines) to all splitters for better UX.
 - v2.21.0:
   * FIX: DRC violation IDs are now unique per touch, fixing the count discrepancy in the UI and confirmation dialogs.
-================================================================================
-"""
-__version__ = "2.21.0"
+- v2.22.0:
+  * FEATURE: Ball Count Analysis tool (Tools -> Ball Count Analysis).
+  * Reads Net Sort sheet; computes per-die L2 ball requirements from L1 bump ratios.
+  * Searchable, sortable table with TOTALS row; Privacy Blur and Excel export.
 
 import sys
 import os
@@ -2742,6 +2743,351 @@ class BallMapEditor(QDialog):
         self.lbl_selection.setText(f"<b>Selected Cells:</b> {total}")
 
 
+class BallCountAnalysis(QDialog):
+    """Ball Count Analysis GUI.
+
+    Reads the 'Net Sort' sheet from the currently-loaded Excel file and
+    calculates, for each net, how many L2 balls (bumps) are required per die
+    based on each die's share of L1 bumps.  The per-die totals are displayed
+    in a sortable, searchable table.
+    """
+
+    def __init__(self, parent_gui):
+        super().__init__(None)
+        self.parent_gui = parent_gui
+        self.is_blurred = False
+        self.die_columns = []
+        self.result_data = []  # list of (net_name, {die: l2_count}, l2_total, total_l1)
+
+        self.setWindowTitle(f"Ball Map Viewer v{__version__} - Ball Count Analysis")
+
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(base_dir, "BallMapViewer.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
+        self.resize(1100, 750)
+        self.init_ui()
+        self.load_and_compute()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def init_ui(self):
+        base_layout = QVBoxLayout(self)
+        base_layout.setContentsMargins(0, 0, 0, 0)
+
+        # ---- Toolbar ----
+        self.toolbar = QToolBar()
+
+        self.act_export = QAction("💾 Export Excel", self)
+        self.act_export.setToolTip("Export ball count table to Excel")
+        self.act_export.triggered.connect(self.export_excel)
+        self.toolbar.addAction(self.act_export)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.toolbar.addWidget(spacer)
+
+        self.btn_privacy = QAction("👁️ Privacy Blur", self)
+        self.btn_privacy.setCheckable(True)
+        self.btn_privacy.setToolTip("Toggle Privacy Filter")
+        self.btn_privacy.toggled.connect(self.toggle_privacy)
+        self.toolbar.addAction(self.btn_privacy)
+
+        base_layout.addWidget(self.toolbar)
+
+        # ---- Content: table (top) + console (bottom) via splitter ----
+        content_splitter = QSplitter(Qt.Orientation.Vertical)
+        content_splitter.setStyleSheet("""
+            QSplitter::handle:vertical {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #eee, stop:0.4 #eee, stop:0.5 #888, stop:0.6 #eee, stop:1 #eee);
+                height: 6px;
+            }
+        """)
+
+        # ---- Table pane ----
+        table_pane = QWidget()
+        table_layout = QVBoxLayout(table_pane)
+        table_layout.setContentsMargins(4, 4, 4, 0)
+
+        # Search bar (mirrors main GUI style)
+        search_lay = QHBoxLayout()
+        self.input_search = QLineEdit()
+        self.input_search.setPlaceholderText("Search Nets (e.g., VDD)")
+        self.input_search.textChanged.connect(self.filter_table)
+        self.cb_use_regex = QCheckBox("Use strict Regex")
+        self.cb_use_regex.stateChanged.connect(self.filter_table)
+        btn_info = QPushButton("ℹ️")
+        btn_info.setMaximumWidth(30)
+        btn_info.setToolTip("Regex help")
+        btn_info.clicked.connect(self.show_regex_info)
+        search_lay.addWidget(self.input_search)
+        search_lay.addWidget(self.cb_use_regex)
+        search_lay.addWidget(btn_info)
+        table_layout.addLayout(search_lay)
+
+        self.table = QTableWidget()
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet("alternate-background-color: #F0F0F0; background-color: #FFFFFF;")
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSortingEnabled(True)
+        table_layout.addWidget(self.table)
+
+        content_splitter.addWidget(table_pane)
+
+        # ---- Console pane ----
+        console_pane = QWidget()
+        console_layout = QVBoxLayout(console_pane)
+        console_layout.setContentsMargins(4, 4, 4, 4)
+        console_layout.addWidget(QLabel("<b>Message Console</b>"))
+        self.console = QTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setStyleSheet(
+            "background-color: #FFFFFF; color: #000000; "
+            "font-family: monospace; border: 1px solid #CCC; padding-bottom: 1em;"
+        )
+        console_layout.addWidget(self.console)
+        content_splitter.addWidget(console_pane)
+
+        content_splitter.setSizes([620, 130])
+        base_layout.addWidget(content_splitter)
+
+    # ------------------------------------------------------------------
+    # Data loading & computation
+    # ------------------------------------------------------------------
+
+    def load_and_compute(self):
+        file_path = self.parent_gui.current_file_path
+        if not file_path:
+            QMessageBox.critical(self, "Error", "No file is currently loaded.")
+            self.close()
+            return
+        try:
+            xl = pd.ExcelFile(file_path)
+            if 'Net Sort' not in xl.sheet_names:
+                QMessageBox.critical(
+                    self, "Sheet Not Found",
+                    "The 'Net Sort' sheet was not found in the loaded Excel file.\n"
+                    "Ball Count Analysis requires the Net Sort sheet."
+                )
+                self.close()
+                return
+
+            df = pd.read_excel(file_path, sheet_name='Net Sort')
+            df.columns = df.columns.str.strip()
+
+            # Identify die columns (D1, D2, … Dn)
+            die_cols = [c for c in df.columns if re.match(r'^D\d+$', str(c).strip())]
+            die_cols.sort(key=lambda x: int(re.search(r'\d+', x).group()))
+            self.die_columns = die_cols
+
+            L2_COL = 'L2 Count'
+            NET_COL = 'NetName'
+
+            self.result_data = []
+            for _, row in df.iterrows():
+                net = str(row.get(NET_COL, '')).strip()
+                if not net or net == 'nan' or net.lower() == 'totals':
+                    continue
+
+                l2_count = float(row.get(L2_COL, 0) or 0)
+                die_vals = {d: float(row.get(d, 0) or 0) for d in die_cols}
+                total_l1 = sum(die_vals.values())
+
+                die_l2 = {}
+                if total_l1 > 0:
+                    for d in die_cols:
+                        die_l2[d] = round(die_vals[d] / total_l1 * l2_count)
+                else:
+                    for d in die_cols:
+                        die_l2[d] = 0
+
+                self.result_data.append((net, die_l2, int(l2_count), int(total_l1)))
+
+            self.populate_table()
+            self.log(
+                f"Loaded {len(self.result_data)} nets from 'Net Sort' sheet. "
+                f"Dies detected: {', '.join(die_cols) if die_cols else 'none'}."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load Net Sort sheet:\n{str(e)}")
+
+    # ------------------------------------------------------------------
+    # Table population
+    # ------------------------------------------------------------------
+
+    def populate_table(self):
+        die_cols = self.die_columns
+        # Columns: Net Name | D1 (L2) | D2 (L2) | … | L2 Count | Total L1
+        col_headers = (
+            ["Net Name"]
+            + [f"{d} (L2)" for d in die_cols]
+            + ["L2 Count", "Total L1"]
+        )
+
+        self.table.setSortingEnabled(False)
+        self.table.setColumnCount(len(col_headers))
+        self.table.setHorizontalHeaderLabels(col_headers)
+        self.table.setRowCount(len(self.result_data) + 1)  # +1 for TOTALS row
+
+        die_totals = {d: 0 for d in die_cols}
+
+        for row_idx, (net, die_l2, l2_count, total_l1) in enumerate(self.result_data):
+            self.table.setItem(row_idx, 0, QTableWidgetItem(net))
+            for col_idx, d in enumerate(die_cols):
+                val = die_l2[d]
+                die_totals[d] += val
+                item = NumericItem(str(val))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(row_idx, col_idx + 1, item)
+            l2_item = NumericItem(str(l2_count))
+            l2_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row_idx, len(die_cols) + 1, l2_item)
+            l1_item = NumericItem(str(total_l1))
+            l1_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row_idx, len(die_cols) + 2, l1_item)
+
+        # TOTALS row (always last, never hidden)
+        totals_row = len(self.result_data)
+        bold_font = QFont()
+        bold_font.setBold(True)
+        header_brush = QBrush(QColor(HEADER_BG))
+
+        totals_label = QTableWidgetItem("TOTALS")
+        totals_label.setFont(bold_font)
+        totals_label.setBackground(header_brush)
+        self.table.setItem(totals_row, 0, totals_label)
+
+        for col_idx, d in enumerate(die_cols):
+            item = NumericItem(str(die_totals[d]))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item.setFont(bold_font)
+            item.setBackground(header_brush)
+            self.table.setItem(totals_row, col_idx + 1, item)
+
+        for extra_col in range(len(die_cols) + 1, len(col_headers)):
+            item = QTableWidgetItem("")
+            item.setBackground(header_brush)
+            self.table.setItem(totals_row, extra_col, item)
+
+        # Column sizing
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col_idx in range(1, len(col_headers)):
+            hdr.setSectionResizeMode(col_idx, QHeaderView.ResizeMode.ResizeToContents)
+
+        self.table.setSortingEnabled(True)
+
+    # ------------------------------------------------------------------
+    # Search / filter
+    # ------------------------------------------------------------------
+
+    def filter_table(self):
+        pattern = self.input_search.text().strip()
+        use_regex = self.cb_use_regex.isChecked()
+        try:
+            if use_regex:
+                regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            return
+
+        totals_row = self.table.rowCount() - 1
+        for idx in range(totals_row):
+            net_item = self.table.item(idx, 0)
+            if net_item:
+                net_text = net_item.text()
+                if use_regex:
+                    is_visible = bool(regex.fullmatch(net_text)) if pattern else True
+                else:
+                    is_visible = pattern.upper() in net_text.upper()
+                self.table.setRowHidden(idx, not is_visible)
+
+        # TOTALS row is always visible
+        self.table.setRowHidden(totals_row, False)
+
+    def show_regex_info(self):
+        QMessageBox.information(
+            self, "Regex Match Info",
+            "<b>Regex Matching Rules:</b><br><br>"
+            "• <b>^VDD.*</b> : Matches any net starting with VDD.<br>"
+            "• <b>.*CLK.*</b> : Matches any net containing CLK.<br>"
+            "• <b>_N\\d+$</b> : Matches nets ending in _N followed by a number.<br><br>"
+            "<i>Check 'Use strict Regex' to evaluate rules. "
+            "Otherwise, uses simple sub-string matching.</i>"
+        )
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def export_excel(self):
+        if not self.result_data:
+            QMessageBox.information(self, "Export", "No data to export.")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export Ball Count Analysis", "", "Excel Files (*.xlsx)"
+        )
+        if not file_path:
+            return
+        try:
+            die_cols = self.die_columns
+            rows = []
+            for net, die_l2, l2_count, total_l1 in self.result_data:
+                row = {"Net Name": net}
+                for d in die_cols:
+                    row[f"{d} (L2)"] = die_l2[d]
+                row["L2 Count"] = l2_count
+                row["Total L1"] = total_l1
+                rows.append(row)
+
+            # Totals row
+            totals = {"Net Name": "TOTALS"}
+            for d in die_cols:
+                totals[f"{d} (L2)"] = sum(r[f"{d} (L2)"] for r in rows)
+            rows.append(totals)
+
+            pd.DataFrame(rows).to_excel(file_path, index=False)
+            self.log(f"Exported ball count analysis to '{os.path.basename(file_path)}'.")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export:\n{str(e)}")
+
+    # ------------------------------------------------------------------
+    # Privacy blur (mirrors Diff / Editor GUIs)
+    # ------------------------------------------------------------------
+
+    def toggle_privacy(self, checked):
+        self.is_blurred = checked
+        if checked:
+            blur = QGraphicsBlurEffect()
+            blur.setBlurRadius(15)
+            self.table.setGraphicsEffect(blur)
+            self.table.viewport().update()
+            self.log("Privacy filter ON.")
+        else:
+            self.table.setGraphicsEffect(None)
+            self.table.viewport().update()
+            self.log("Privacy filter OFF.")
+
+    # ------------------------------------------------------------------
+    # Console
+    # ------------------------------------------------------------------
+
+    def log(self, message):
+        self.console.append(f"> {message}")
+        self.console.verticalScrollBar().setValue(
+            self.console.verticalScrollBar().maximum()
+        )
+
+
 class BallMapViewer(QMainWindow):
     def __init__(self, debug_mode=False):
         super().__init__()
@@ -2780,8 +3126,10 @@ class BallMapViewer(QMainWindow):
         self.drc_results = {}
         
         self.base_device, self.base_version = "Unknown", "0.0"
+        self.current_file_path = None
         self.view_counter = 1
         self.pan_active = False
+        self.active_ball_count_dialog = None
 
         self.load_recent_files()
         self.init_ui()
@@ -3097,6 +3445,10 @@ class BallMapViewer(QMainWindow):
         diff_act = QAction("Launch Diff Interface...", self)
         diff_act.triggered.connect(self.launch_diff_gui)
         tools_menu.addAction(diff_act)
+        tools_menu.addSeparator()
+        ball_count_act = QAction("Ball Count Analysis...", self)
+        ball_count_act.triggered.connect(self.launch_ball_count_analysis)
+        tools_menu.addAction(ball_count_act)
 
         help_menu = menubar.addMenu("Help")
         about_act = QAction("About", self)
@@ -3705,6 +4057,7 @@ class BallMapViewer(QMainWindow):
             
         try:
             filename = os.path.basename(file_path)
+            self.current_file_path = file_path
             self.base_device, self.base_version = self.extract_metadata(filename)
             self.setWindowTitle(f"Ball Map Viewer v{__version__}  |  {self.base_device} (Rev {self.base_version})")
             
@@ -4125,15 +4478,34 @@ class BallMapViewer(QMainWindow):
                 is_vis = False
             except AttributeError:
                 is_vis = False
-                
+
             if not is_vis:
                 self.active_diff_dialog = ComparisonDialog(self, self.debug_mode)
                 self.active_diff_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
                 self.active_diff_dialog.show()
             self.active_diff_dialog.activateWindow()
             self.log("Launched Standalone Diff Interface.")
-        except Exception as e: 
+        except Exception as e:
             QMessageBox.critical(self, "Comparison Error", f"Failed to launch Diff interface:\n{str(e)}")
+
+    def launch_ball_count_analysis(self):
+        if not self.current_file_path:
+            QMessageBox.warning(self, "Warning", "Please load a map first before launching Ball Count Analysis.")
+            return
+        try:
+            try:
+                is_vis = self.active_ball_count_dialog.isVisible()
+            except (RuntimeError, AttributeError):
+                is_vis = False
+
+            if not is_vis:
+                self.active_ball_count_dialog = BallCountAnalysis(self)
+                self.active_ball_count_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+                self.active_ball_count_dialog.show()
+            self.active_ball_count_dialog.activateWindow()
+            self.log("Launched Ball Count Analysis.")
+        except Exception as e:
+            QMessageBox.critical(self, "Ball Count Analysis Error", f"Failed to launch Ball Count Analysis:\n{str(e)}")
 
 if __name__ == '__main__':
     # ONLY apply the AppID trick if running as a raw .py script
